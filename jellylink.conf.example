@@ -1,0 +1,15 @@
+[DEFAULT]
+# JellyLink Configuration File - EXAMPLE
+# Copy this to jellylink.conf and customize
+
+DRY_RUN = true
+WATCH_FOLDER = ~/Downloads
+MEDIA_ROOT = /media
+TV_FOLDER = TV
+MOVIE_FOLDER = Movies
+SKIP_SAMPLES = true
+LOG_FILE = 
+DOWNLOAD_GRACE_PERIOD = 60
+SCAN_INTERVAL = 15
+SCAN_SUBFOLDERS = true
+MAX_SUBFOLDER_DEPTH = 1
