@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import os
 import re
 import sys
@@ -12,12 +11,15 @@ from typing import Optional, Tuple
 import datetime
 import errno
 import shutil
+import sqlite3
 
-# Force UTF-8 for stdout/stderr
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr.reconfigure(encoding='utf-8')
+# WhatsApp notifications
+try:
+    from twilio.rest import Client
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TWILIO_AVAILABLE = False
+    print("Warning: twilio not installed. Install with: pip install twilio --break-system-packages")
 
 # ---------------------------------------------------------
 # COMMAND-LINE ARGUMENTS
@@ -40,7 +42,7 @@ default_conf = os.path.join(script_dir, "jellylink.conf")
 config_path = args.config if args.config else default_conf
 
 config = configparser.ConfigParser()
-config.read(config_path, encoding='utf-8')
+config.read(config_path)
 
 DRY_RUN = get_bool(config.get("DEFAULT", "DRY_RUN", fallback="true"))
 if args.dry_run:
@@ -57,9 +59,15 @@ LOG_FILE = config.get("DEFAULT", "LOG_FILE", fallback="").strip()
 DOWNLOAD_GRACE_PERIOD = int(config.get("DEFAULT", "DOWNLOAD_GRACE_PERIOD", fallback="60"))
 SCAN_INTERVAL = int(config.get("DEFAULT", "SCAN_INTERVAL", fallback="15"))
 
-# New option: scan subfolders
-SCAN_SUBFOLDERS = get_bool(config.get("DEFAULT", "SCAN_SUBFOLDERS", fallback="true"))
-MAX_SUBFOLDER_DEPTH = int(config.get("DEFAULT", "MAX_SUBFOLDER_DEPTH", fallback="1"))
+# WhatsApp notification settings
+ENABLE_WHATSAPP = get_bool(config.get("DEFAULT", "ENABLE_WHATSAPP", fallback="false"))
+TWILIO_ACCOUNT_SID = config.get("DEFAULT", "TWILIO_ACCOUNT_SID", fallback="")
+TWILIO_AUTH_TOKEN = config.get("DEFAULT", "TWILIO_AUTH_TOKEN", fallback="")
+TWILIO_WHATSAPP_FROM = config.get("DEFAULT", "TWILIO_WHATSAPP_FROM", fallback="+14155238886")
+WHATSAPP_TO = config.get("DEFAULT", "WHATSAPP_TO", fallback="")
+
+# Database for dashboard
+DB_PATH = os.path.join(script_dir, "jellylink.db")
 
 # ---------------------------------------------------------
 # LOGGING
@@ -176,21 +184,129 @@ def create_hardlink(src: str, dst: str) -> None:
             log(f"[ERROR] Linking failed: {e}")
 
 def clean_title(name: str) -> str:
-    """Clean title while preserving Unicode characters."""
-    # Replace separators with spaces
-    name = re.sub(r"[._]+", " ", name)
-    
-    # Remove filesystem-unsafe characters (Windows is strictest)
-    # Keep: letters (any language), numbers, spaces, hyphens, parentheses
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    
-    # Normalize whitespace
+    name = re.sub(r"[._()]+", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
-    
-    # Remove leading/trailing dots (Windows issue)
-    name = name.strip('.')
-    
     return name
+
+# ---------------------------------------------------------
+# WHATSAPP NOTIFICATIONS
+# ---------------------------------------------------------
+
+def send_whatsapp_notification(title: str, media_type: str, details: str) -> None:
+    """Send WhatsApp notification when new media is processed"""
+    if not ENABLE_WHATSAPP:
+        return
+    
+    if not TWILIO_AVAILABLE:
+        log("[WHATSAPP ERROR] Twilio library not installed")
+        return
+    
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, WHATSAPP_TO]):
+        log("[WHATSAPP ERROR] Missing Twilio credentials in config")
+        return
+    
+    if DRY_RUN:
+        log(f"[DRY RUN] Would send WhatsApp: {media_type} - {title} - {details}")
+        return
+    
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        message_body = f"🎬 New {media_type} Added!\n\n📺 {title}\n📋 {details}\n\n✅ Ready to watch!"
+        
+        message = client.messages.create(
+            from_=f'whatsapp:{TWILIO_WHATSAPP_FROM}',
+            body=message_body,
+            to=f'whatsapp:{WHATSAPP_TO}'
+        )
+        
+        log(f"[WHATSAPP] Notification sent: {title} (SID: {message.sid})")
+        log_notification(title, media_type, details, "sent")
+    except Exception as e:
+        log(f"[WHATSAPP ERROR] Failed to send notification: {e}")
+        log_notification(title, media_type, details, "failed")
+
+# ---------------------------------------------------------
+# DATABASE LOGGING
+# ---------------------------------------------------------
+
+def init_db() -> None:
+    """Initialize database for dashboard"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS processed_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            title TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            season INTEGER,
+            episode INTEGER,
+            year INTEGER,
+            file_size INTEGER,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            destination TEXT
+        )
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            details TEXT,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def log_processed_media(filename: str, title: str, media_type: str, season: int = None, episode: int = None, year: int = None, destination: str = "") -> None:
+    """Log processed media to database"""
+    if DRY_RUN:
+        return
+        
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        file_size = 0
+        file_path = os.path.join(WATCH_FOLDER, filename)
+        if os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+        
+        c.execute('''
+            INSERT INTO processed_media 
+            (filename, title, media_type, season, episode, year, file_size, destination)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (filename, title, media_type, season, episode, year, file_size, destination))
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[DB ERROR] Failed to log media: {e}")
+
+def log_notification(title: str, media_type: str, details: str, status: str) -> None:
+    """Log notification to database"""
+    if DRY_RUN:
+        return
+        
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        c.execute('''
+            INSERT INTO notifications (title, media_type, details, status)
+            VALUES (?, ?, ?, ?)
+        ''', (title, media_type, details, status))
+        
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"[DB ERROR] Failed to log notification: {e}")
 
 # ---------------------------------------------------------
 # PARSING (TV + MOVIES)
@@ -284,6 +400,13 @@ def process_tv(src: str, title: str, season: int, episode: int) -> None:
     dest_name = f"{title.replace(' ', '.')}.S{season:02d}E{episode:02d}{Path(src).suffix}"
     dest_path = os.path.join(dest_dir, dest_name)
     create_hardlink(src, dest_path)
+    
+    # Log to database
+    log_processed_media(Path(src).name, title, "TV", season, episode, None, dest_path)
+    
+    # Send WhatsApp notification
+    details = f"S{season:02d}E{episode:02d}"
+    send_whatsapp_notification(title, "TV Show", details)
 
 def process_movie(src: str, title: str, year: Optional[int]) -> None:
     folder_name = f"{title} ({year})" if year else title
@@ -295,26 +418,37 @@ def process_movie(src: str, title: str, year: Optional[int]) -> None:
     dest_name = base_name + Path(src).suffix
     dest_path = os.path.join(dest_dir, dest_name)
     create_hardlink(src, dest_path)
+    
+    # Log to database
+    log_processed_media(Path(src).name, title, "Movie", None, None, year, dest_path)
+    
+    # Send WhatsApp notification
+    details = f"({year})" if year else "Year unknown"
+    send_whatsapp_notification(title, "Movie", details)
 
-def process_file(path: str) -> None:
+def process_file(path: str) -> bool:
+    """
+    Process a file and return True if successfully handled.
+    Returns False if file should be retried later.
+    """
     filename = Path(path).name
 
     # Explicitly skip temporary/partial download files
     if is_temporary_file(filename):
         log(f"[SKIP] Temporary/partial file: {filename}")
-        return
+        return False
 
     # Only consider known video file extensions
     if not is_video_file(filename):
-        return
+        return False
 
     if SKIP_SAMPLES and "sample" in filename.lower():
         log(f"[SKIP] Sample file: {filename}")
-        return
+        return True  # Don't retry samples
 
     if is_recently_modified(path, DOWNLOAD_GRACE_PERIOD):
         log(f"[WAIT] Recently modified: {filename}")
-        return
+        return False  # Retry later when grace period expires
 
     # TV ALWAYS wins over movie
     tv_info = detect_tv(filename)
@@ -322,7 +456,7 @@ def process_file(path: str) -> None:
         title, season, episode = tv_info
         log(f"[TV] {filename} → {title} S{season:02d}E{episode:02d}")
         process_tv(path, title, season, episode)
-        return
+        return True  # Successfully processed
 
     # Only detect movie if NOT TV
     movie_info = detect_movie(filename)
@@ -330,55 +464,55 @@ def process_file(path: str) -> None:
         title, year = movie_info
         log(f"[MOVIE] {filename} → {title} ({year})" if year else f"[MOVIE] {filename} → {title}")
         process_movie(path, title, year)
-        return
+        return True  # Successfully processed
 
     log(f"[UNMATCHED] {filename}")
+    return True  # Don't retry unmatched files
 
 # ---------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------
 
 def main() -> None:
+    # Initialize database
+    init_db()
+    
     log(f"Watching: {WATCH_FOLDER}")
     log(f"Media root: {BASE_MEDIA_FOLDER}")
     log(f"DRY RUN: {DRY_RUN}")
     log(f"Skip samples: {SKIP_SAMPLES}")
-    log(f"Scan subfolders: {SCAN_SUBFOLDERS} (max depth: {MAX_SUBFOLDER_DEPTH})")
+    log(f"WhatsApp notifications: {ENABLE_WHATSAPP}")
+    log(f"Dashboard database: {DB_PATH}")
 
     if not os.path.isdir(WATCH_FOLDER):
         log(f"[ERROR] Watch folder missing: {WATCH_FOLDER}")
         sys.exit(1)
 
-    seen = set()
+    processed = set()  # Track successfully processed files
 
     log("Monitoring started.")
 
     try:
         while True:
-            if SCAN_SUBFOLDERS:
-                # Scan WATCH_FOLDER and subfolders up to MAX_SUBFOLDER_DEPTH
-                for root, dirs, files in os.walk(WATCH_FOLDER):
-                    # Calculate depth relative to WATCH_FOLDER
-                    depth = root.replace(WATCH_FOLDER, '').count(os.sep)
-                    
-                    # Skip if too deep
-                    if depth > MAX_SUBFOLDER_DEPTH:
-                        # Don't descend further into subdirectories
-                        dirs.clear()
-                        continue
-                    
-                    for filename in files:
-                        full_path = os.path.join(root, filename)
-                        if full_path not in seen:
-                            process_file(full_path)
-                            seen.add(full_path)
-            else:
-                # Original behavior: only scan root of WATCH_FOLDER
-                for filename in os.listdir(WATCH_FOLDER):
-                    full_path = os.path.join(WATCH_FOLDER, filename)
-                    if os.path.isfile(full_path) and full_path not in seen:
-                        process_file(full_path)
-                        seen.add(full_path)
+            # Ignore subfolders – only process files directly in WATCH_FOLDER
+            for filename in os.listdir(WATCH_FOLDER):
+                full_path = os.path.join(WATCH_FOLDER, filename)
+                
+                # Skip if not a file
+                if not os.path.isfile(full_path):
+                    continue
+                
+                # Skip if already successfully processed
+                if full_path in processed:
+                    continue
+                
+                # Try to process the file
+                success = process_file(full_path)
+                
+                # Only mark as processed if successfully handled
+                # Files waiting for grace period will be retried next scan
+                if success:
+                    processed.add(full_path)
 
             time.sleep(SCAN_INTERVAL)
     except KeyboardInterrupt:
