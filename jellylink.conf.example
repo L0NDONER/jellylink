@@ -1,0 +1,29 @@
+[DEFAULT]
+# Watch folder for new downloads
+WATCH_FOLDER = ~/Downloads
+
+# Media library root
+MEDIA_ROOT = /media
+TV_FOLDER = TV
+MOVIE_FOLDER = Movies
+
+# Operation mode
+DRY_RUN = false
+
+# File handling
+SKIP_SAMPLES = true
+RECURSIVE_SCAN = true
+
+# Timing (seconds)
+DOWNLOAD_GRACE_PERIOD = 60
+SCAN_INTERVAL = 15
+
+# Logging
+LOG_FILE = 
+
+# WhatsApp notifications (optional)
+ENABLE_WHATSAPP = false
+TWILIO_ACCOUNT_SID = 
+TWILIO_AUTH_TOKEN = 
+TWILIO_WHATSAPP_FROM = +14155238886
+WHATSAPP_TO = 

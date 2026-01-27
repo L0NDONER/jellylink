@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# JellyLink specific
+jellylink.db
+jellylink.db-journal
+*.log
+
+# Sensitive config (we'll create a template instead)
+jellylink.conf
+
+# OS files
+.DS_Store
+Thumbs.db
