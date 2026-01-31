@@ -21,3 +21,5 @@ jellylink.conf
 # OS files
 .DS_Store
 Thumbs.db
+jellylink.db
+jellylink.log
