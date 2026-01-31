@@ -28,6 +28,7 @@ except ImportError:
 parser = argparse.ArgumentParser(description="JellyLink Media Organizer")
 parser.add_argument("--config", help="Path to config file", default=None)
 parser.add_argument("--dry-run", help="Force dry-run mode (overrides config)", action="store_true")
+parser.add_argument("--apply", help="Execute changes (overrides dry-run mode)", action="store_true")
 args = parser.parse_args()
 
 # ---------------------------------------------------------
@@ -45,7 +46,9 @@ config = configparser.ConfigParser()
 config.read(config_path)
 
 DRY_RUN = get_bool(config.get("DEFAULT", "DRY_RUN", fallback="true"))
-if args.dry_run:
+if args.apply:
+    DRY_RUN = False
+elif args.dry_run:
     DRY_RUN = True
 
 WATCH_FOLDER = os.path.expanduser(config.get("DEFAULT", "WATCH_FOLDER", fallback="~/Downloads"))
