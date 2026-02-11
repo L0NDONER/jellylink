@@ -2,3 +2,10 @@ jellylink.db
 jellylink.log
 __pycache__/
 *.pyc
+jellylink.conf
+jellylink.db
+jellylink.log
+__pycache__/
+*.jl-tmp
+jellylink.backup.py
+test.py
