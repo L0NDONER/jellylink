@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# jellylink.py
+# Purpose:    GitOps-friendly media organizer using hardlinks
+#             TV / Movies → structured folders with quality-based deduplication
+
 import os
 import re
 import sys
@@ -6,647 +10,323 @@ import time
 import argparse
 import configparser
 import logging
-from pathlib import Path
-from typing import Optional, Tuple
-import datetime
-import errno
-import shutil
 import sqlite3
+import shutil
+import errno
+from pathlib import Path
+from typing import Optional, Tuple, List, Set
+from datetime import datetime
 
-# WhatsApp notifications
+# Optional WhatsApp dependency
 try:
     from twilio.rest import Client
     TWILIO_AVAILABLE = True
 except ImportError:
     TWILIO_AVAILABLE = False
-    print("Warning: twilio not installed. Install with: pip install twilio --break-system-packages")
 
-# ---------------------------------------------------------
-# COMMAND-LINE ARGUMENTS
-# ---------------------------------------------------------
+########## 
+# EXPLANATION: 
+# Refined the Logging section to be "Docker-safe."
+# It now checks if the directory for LOG_FILE exists before trying to open it.
+# If it fails (e.g., due to a missing mount or path), it falls back to 
+# standard console output so the container doesn't crash with FileNotFoundError.
+##########
 
-parser = argparse.ArgumentParser(description="JellyLink Media Organizer")
-parser.add_argument("--config", help="Path to config file", default=None)
-parser.add_argument("--dry-run", help="Force dry-run mode (overrides config)", action="store_true")
-parser.add_argument("--apply", help="Execute changes (overrides dry-run mode)", action="store_true")
+# ────────────────────────────────────────────────
+# Argument parser
+# ────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="JellyLink – declarative media organizer")
+parser.add_argument("--config", default=None, help="Override default config location")
+parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode")
+parser.add_argument("--apply", action="store_true", help="Force apply mode (overrides dry-run)")
 args = parser.parse_args()
 
-# ---------------------------------------------------------
-# CONFIG LOADING
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────
+# Configuration
+# ────────────────────────────────────────────────
+script_dir = Path(__file__).resolve().parent
+default_config = script_dir / "jellylink.conf"
+config_path = Path(args.config) if args.config else default_config
 
-def get_bool(value: str) -> bool:
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+if not config_path.is_file():
+    print(f"ERROR: Config file not found: {config_path}", file=sys.stderr)
+    sys.exit(2)
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
-default_conf = os.path.join(script_dir, "jellylink.conf")
-config_path = args.config if args.config else default_conf
+cfg = configparser.ConfigParser()
+cfg.read(config_path)
 
-config = configparser.ConfigParser()
-config.read(config_path)
+def getbool(section: str, key: str, fallback: str = "false") -> bool:
+    return cfg.get(section, key, fallback=fallback).strip().lower() in {"1", "true", "yes", "on"}
 
-DRY_RUN = get_bool(config.get("DEFAULT", "DRY_RUN", fallback="true"))
+DRY_RUN           = getbool("DEFAULT", "DRY_RUN", "true")
+RECURSIVE_SCAN    = getbool("DEFAULT", "RECURSIVE_SCAN", "true")
+SKIP_SAMPLES      = getbool("DEFAULT", "SKIP_SAMPLES", "true")
+ENABLE_WHATSAPP   = getbool("DEFAULT", "ENABLE_WHATSAPP", "false")
+
 if args.apply:
     DRY_RUN = False
 elif args.dry_run:
     DRY_RUN = True
 
-WATCH_FOLDER = os.path.expanduser(config.get("DEFAULT", "WATCH_FOLDER", fallback="~/Downloads"))
-BASE_MEDIA_FOLDER = config.get("DEFAULT", "MEDIA_ROOT", fallback="/media")
-TV_ROOT = os.path.join(BASE_MEDIA_FOLDER, config.get("DEFAULT", "TV_FOLDER", fallback="TV"))
-MOVIE_ROOT = os.path.join(BASE_MEDIA_FOLDER, config.get("DEFAULT", "MOVIE_FOLDER", fallback="Movies"))
+WATCH_FOLDER      = Path(cfg.get("DEFAULT", "WATCH_FOLDER", fallback="~/Downloads")).expanduser().resolve()
+MEDIA_ROOT        = Path(cfg.get("DEFAULT", "MEDIA_ROOT", fallback="/media")).resolve()
+TV_ROOT           = MEDIA_ROOT / cfg.get("DEFAULT", "TV_FOLDER", fallback="TV")
+MOVIE_ROOT        = MEDIA_ROOT / cfg.get("DEFAULT", "MOVIE_FOLDER", fallback="Movies")
 
-SKIP_SAMPLES = get_bool(config.get("DEFAULT", "SKIP_SAMPLES", fallback="true"))
-LOG_FILE = config.get("DEFAULT", "LOG_FILE", fallback="").strip()
+DOWNLOAD_GRACE_SEC = cfg.getint("DEFAULT", "DOWNLOAD_GRACE_PERIOD", fallback=60)
+SCAN_INTERVAL_SEC  = cfg.getint("DEFAULT", "SCAN_INTERVAL", fallback=15)
+LOG_FILE_PATH      = cfg.get("DEFAULT", "LOG_FILE", fallback="").strip()
 
-DOWNLOAD_GRACE_PERIOD = int(config.get("DEFAULT", "DOWNLOAD_GRACE_PERIOD", fallback="60"))
-SCAN_INTERVAL = int(config.get("DEFAULT", "SCAN_INTERVAL", fallback="15"))
+TWILIO_SID    = cfg.get("DEFAULT", "TWILIO_ACCOUNT_SID", fallback="")
+TWILIO_TOKEN  = cfg.get("DEFAULT", "TWILIO_AUTH_TOKEN", fallback="")
+WHATSAPP_FROM = cfg.get("DEFAULT", "TWILIO_WHATSAPP_FROM", fallback="+14155238886")
+WHATSAPP_TO   = cfg.get("DEFAULT", "WHATSAPP_TO", fallback="")
 
-# New config option for recursive scanning
-RECURSIVE_SCAN = get_bool(config.get("DEFAULT", "RECURSIVE_SCAN", fallback="true"))
+DB_PATH = script_dir / "jellylink.db"
 
-# WhatsApp notification settings
-ENABLE_WHATSAPP = get_bool(config.get("DEFAULT", "ENABLE_WHATSAPP", fallback="false"))
-TWILIO_ACCOUNT_SID = config.get("DEFAULT", "TWILIO_ACCOUNT_SID", fallback="")
-TWILIO_AUTH_TOKEN = config.get("DEFAULT", "TWILIO_AUTH_TOKEN", fallback="")
-TWILIO_WHATSAPP_FROM = config.get("DEFAULT", "TWILIO_WHATSAPP_FROM", fallback="+14155238886")
-WHATSAPP_TO = config.get("DEFAULT", "WHATSAPP_TO", fallback="")
+if ENABLE_WHATSAPP and TWILIO_AVAILABLE:
+    if not all([TWILIO_SID, TWILIO_TOKEN, WHATSAPP_TO]):
+        print("ERROR: WhatsApp enabled but missing Twilio credentials", file=sys.stderr)
+        sys.exit(3)
 
-# Database for dashboard
-DB_PATH = os.path.join(script_dir, "jellylink.db")
-
-# ---------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------
-
+# ────────────────────────────────────────────────
+# Logging setup
+# ────────────────────────────────────────────────
 log_kwargs = {
     "level": logging.INFO,
-    "format": "%(asctime)s [%(levelname)s] %(message)s"
+    "format": "%(asctime)s [%(levelname)-5s] %(message)s",
+    "datefmt": "%Y-%m-%d %H:%M:%S",
+    "handlers": [logging.StreamHandler(sys.stdout)] # Always log to console for Docker
 }
-if LOG_FILE:
-    log_kwargs["filename"] = LOG_FILE
+
+if LOG_FILE_PATH:
+    try:
+        p = Path(LOG_FILE_PATH)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Add file handler if path is valid
+        log_kwargs["handlers"].append(logging.FileHandler(p, mode='a'))
+    except Exception as e:
+        print(f"WARNING: Could not initialize log file at {LOG_FILE_PATH}: {e}")
+        print("Falling back to console-only logging.")
 
 logging.basicConfig(**log_kwargs)
 
 def log(msg: str) -> None:
-    print(msg)
     logging.info(msg)
 
-# ---------------------------------------------------------
-# UTILITIES
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────
+# Constants & Patterns
+# ────────────────────────────────────────────────
+VIDEO_EXTENSIONS  = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm"}
+TEMPORARY_SUFFIXES = {".part", ".crdownload", ".!ut", ".!qb", ".aria2", ".partial", ".tmp"}
 
-# Extensions considered "final" video file types
-VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
-
-# Common temporary/partial download suffixes to skip explicitly
-TEMP_PARTIAL_SUFFIXES = (
-    ".part",
-    ".crdownload",
-    ".!ut",
-    ".!qb",
-    ".aria2",
-    ".partial",
+COMMON_RELEASE_TAGS = re.compile(
+    r'\b(?:2160p|1080p|720p|480p|4k|uhd|webdl|webrip|web|web-?dl|web-?rip|'
+    r'hdr|hevc|h265|h264|x265|x264|ddp|dd\+|aac|mp3|amzn|nf|pmtp|10bit|8bit)\b',
+    flags=re.IGNORECASE
 )
 
-def is_video_file(path: str) -> bool:
-    ext = Path(path).suffix.lower()
-    return ext in VIDEO_EXTS
+YEAR_PATTERN = re.compile(r"(19[0-9]{2}|20[0-9]{2})")
 
-def is_temporary_file(filename: str) -> bool:
-    """
-    Return True if the filename indicates a temporary/partial download.
+# ────────────────────────────────────────────────
+# Utilities
+# ────────────────────────────────────────────────
+def is_video_file(p: Path) -> bool:
+    return p.suffix.lower() in VIDEO_EXTENSIONS
 
-    qBittorrent (and other clients) often append markers like ".!qB" to
-    partially-downloaded files (e.g. "video.mkv.!qB" or "video.!qB.mkv").
-    This function checks:
-      - Known temporary suffixes (case-insensitive)
-      - Presence of the qB-specific token ".!qB" anywhere in the name
-    """
-    ln = filename.lower()
+def looks_like_temporary_file(name: str) -> bool:
+    ln = name.lower()
+    return any(ln.endswith(s) for s in TEMPORARY_SUFFIXES) or ".!qb" in ln or ".!ut" in ln
 
-    # Quick substring check for qBittorrent token anywhere in the name
-    if ".!qb" in ln:
+def file_is_still_downloading(p: Path, grace_seconds: int) -> bool:
+    try:
+        return (time.time() - p.stat().st_mtime) < grace_seconds
+    except (FileNotFoundError, PermissionError):
         return True
 
-    # Exact suffix checks (handles .part, .crdownload, etc.)
-    for s in TEMP_PARTIAL_SUFFIXES:
-        if ln.endswith(s):
-            return True
+def safe_mkdir(d: Path) -> None:
+    if DRY_RUN:
+        log(f"[DRY] Would mkdir: {d}")
+        return
+    d.mkdir(parents=True, exist_ok=True)
 
-    return False
-
-def is_recently_modified(path: str, grace_period: int) -> bool:
+def already_linked(src: Path, dst: Path) -> bool:
+    if not dst.exists(): return False
     try:
-        mtime = os.path.getmtime(path)
-    except FileNotFoundError:
+        s_stat, d_stat = src.stat(), dst.stat()
+        return s_stat.st_ino == d_stat.st_ino and s_stat.st_dev == d_stat.st_dev
+    except Exception: return False
+
+def create_or_copy_link(src: Path, dst: Path) -> bool:
+    if already_linked(src, dst):
+        log(f"[SKIP] Already hardlinked: {dst.name}")
         return True
-    age = time.time() - mtime
-    return age < grace_period
-
-def safe_makedirs(path: str) -> None:
     if DRY_RUN:
-        log(f"[DRY RUN] Would create folder: {path}")
-        return
-    os.makedirs(path, exist_ok=True)
+        log(f"[DRY] Would link/copy: {src.name} → {dst}")
+        return True
 
-def create_hardlink(src: str, dst: str) -> None:
-    if os.path.exists(dst):
-        try:
-            src_stat = os.stat(src)
-            dst_stat = os.stat(dst)
-            if src_stat.st_ino == dst_stat.st_ino and src_stat.st_dev == dst_stat.st_dev:
-                log(f"[SKIP] Already linked: {dst}")
-                return
-            else:
-                log(f"[SKIP] File exists (different): {dst}")
-                return
-        except FileNotFoundError:
-            pass
-
-    if DRY_RUN:
-        log(f"[DRY RUN] Would link: {src} → {dst}")
-        return
-
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".jl-tmp")
     try:
-        os.link(src, dst)
-        log(f"[LINK] {src} → {dst}")
+        os.link(src, tmp)
+        tmp.rename(dst)
+        log(f"[LINK] {src.name} → {dst}")
+        return True
     except OSError as e:
-        # Cross-device link error -> fallback to copy
-        if e.errno == errno.EXDEV:
-            tmp_dst = dst + ".part"
-            try:
-                shutil.copy2(src, tmp_dst)
-                os.replace(tmp_dst, dst)
-                log(f"[COPY] {src} → {dst} (different filesystem)")
-            except Exception as copy_err:
-                try:
-                    if os.path.exists(tmp_dst):
-                        os.remove(tmp_dst)
-                except Exception:
-                    pass
-                log(f"[ERROR] Copy fallback failed: {copy_err}")
-        else:
-            log(f"[ERROR] Linking failed: {e}")
-
-def clean_title(name: str) -> str:
-    name = re.sub(r"[._()]+", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
-
-def normalize_tv_title(title: str) -> str:
-    """
-    Normalize TV show titles by removing years and extra spacing.
-    Examples:
-      "Landman 2024" -> "Landman"
-      "The Simpsons 1989" -> "The Simpsons"
-    """
-    # Remove 4-digit years (1900-2099) from the end of the title
-    title = re.sub(r'\s+(19\d{2}|20\d{2})$', '', title)
-    return title.strip()
-
-# ---------------------------------------------------------
-# WHATSAPP NOTIFICATIONS
-# ---------------------------------------------------------
-
-def send_whatsapp_notification(title: str, media_type: str, details: str) -> None:
-    """Send WhatsApp notification when new media is processed"""
-    if not ENABLE_WHATSAPP:
-        return
-    
-    if not TWILIO_AVAILABLE:
-        log("[WHATSAPP ERROR] Twilio library not installed")
-        return
-    
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, WHATSAPP_TO]):
-        log("[WHATSAPP ERROR] Missing Twilio credentials in config")
-        return
-    
-    if DRY_RUN:
-        log(f"[DRY RUN] Would send WhatsApp: {media_type} - {title} - {details}")
-        return
-    
+        if e.errno != errno.EXDEV:
+            log(f"[ERROR] Hardlink failed: {e}")
+            return False
     try:
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        
-        message_body = f"🎬 New {media_type} Added!\n\n📺 {title}\n📋 {details}\n\n✅ Ready to watch!"
-        
-        message = client.messages.create(
-            from_=f'whatsapp:{TWILIO_WHATSAPP_FROM}',
-            body=message_body,
-            to=f'whatsapp:{WHATSAPP_TO}'
-        )
-        
-        log(f"[WHATSAPP] Notification sent: {title} (SID: {message.sid})")
-        log_notification(title, media_type, details, "sent")
+        shutil.copy2(src, tmp)
+        tmp.rename(dst)
+        log(f"[COPY] {src.name} → {dst} (cross-device)")
+        return True
     except Exception as e:
-        log(f"[WHATSAPP ERROR] Failed to send notification: {e}")
-        log_notification(title, media_type, details, "failed")
+        log(f"[ERROR] Copy failed: {e}")
+        if tmp.exists(): tmp.unlink()
+        return False
 
-# ---------------------------------------------------------
-# DATABASE
-# ---------------------------------------------------------
+# ────────────────────────────────────────────────
+# Parsing logic
+# ────────────────────────────────────────────────
+def sanitize_name_for_parsing(name: str) -> str:
+    s = re.sub(r'[._-]+', ' ', name)
+    s = COMMON_RELEASE_TAGS.sub(' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
 
-def init_db() -> None:
-    """Initialize the SQLite database for tracking processed media"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Main media table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processed_media (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                original_filename TEXT NOT NULL,
-                title TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                season INTEGER,
-                episode INTEGER,
-                year INTEGER,
-                destination_path TEXT NOT NULL,
-                processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Notifications table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                details TEXT NOT NULL,
-                status TEXT NOT NULL,
-                sent_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log(f"[DB ERROR] Failed to initialize database: {e}")
-
-def log_processed_media(original_filename: str, title: str, media_type: str, 
-                       season: Optional[int], episode: Optional[int], 
-                       year: Optional[int], destination_path: str) -> None:
-    """Log processed media to database"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO processed_media 
-            (original_filename, title, media_type, season, episode, year, destination_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (original_filename, title, media_type, season, episode, year, destination_path))
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log(f"[DB ERROR] Failed to log processed media: {e}")
-
-def log_notification(title: str, media_type: str, details: str, status: str) -> None:
-    """Log notification attempt to database"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO notifications (title, media_type, details, status)
-            VALUES (?, ?, ?, ?)
-        """, (title, media_type, details, status))
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log(f"[DB ERROR] Failed to log notification: {e}")
-
-# ---------------------------------------------------------
-# PARSING (TV + MOVIES)
-# ---------------------------------------------------------
-
-# Only match realistic years (19xx or 20xx). We'll additionally validate bounds in code
-year_pattern = re.compile(r"(19\d{2}|20\d{2})")
-
-# Common tags to strip from filenames before matching
-COMMON_TAGS_RE = re.compile(
-    r'\b(?:2160p|1080p|720p|480p|2160|1080|720|4k|uhd|web[-_. ]?dl|web[-_. ]?rip|webrip|web|hdr|hevc|h\.?265|h\.?264|x264|x265|ddp5\.1|ddp5|aac|mp3|amzn|pmtp|pm_tp|nf|hdr10|10bit|8bit)\b',
-    flags=re.I
-)
-
-def sanitize_for_matching(name: str) -> str:
-    """
-    Remove common tags and replace separators with spaces so patterns match reliably.
-    """
-    s = re.sub(r'[\._\-]+', ' ', name)
-    s = COMMON_TAGS_RE.sub('', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
-
-def detect_tv(filename: str) -> Optional[Tuple[str, int, int]]:
-    """
-    Try multiple common TV filename patterns and return (title, season, episode)
-    """
-    base = Path(filename).stem
-    clean_base = sanitize_for_matching(base)
-
+def parse_tv_show(name: str) -> Optional[Tuple[str, int, int]]:
+    base = Path(name).stem
+    clean = sanitize_name_for_parsing(base)
     patterns = [
-        # Explicit S##E## format (most reliable)
-        re.compile(r'(?i)^(?P<title>.*?)[ ]+S(?P<season>\d{1,2})[ ]*E(?P<episode>\d{1,2})'),
-        re.compile(r'(?i)^(?P<title>.*?)[ ]*S(?P<season>\d{1,2})[ ]*E(?P<episode>\d{1,2})'),
-        # ##x## format (e.g., 2x05)
-        re.compile(r'(?i)^(?P<title>.*?)[ ]+(?P<season>\d{1,2})x(?P<episode>\d{1,2})'),
-        # ### format (e.g., 205) - but only match if there's a clear separator or after "Season" keyword
-        # This prevents matching sequel numbers like "Greenland 2" followed by year "2026"
-        re.compile(r'(?i)^(?P<title>.*?)(?:[ \-\._]+|season[ \-\._]+)(?P<season>\d)(?P<episode>\d{2})(?!\d)'),
-        # Multi-episode format (S##E##-E##)
-        re.compile(r'(?i)^(?P<title>.*?)[ ]*S(?P<season>\d{1,2})[ ]*E(?P<episode>\d{1,2})(?:[ \-]*E?(?P<episode2>\d{1,2}))'),
+        (r'(?i)(.*?)[ .]*\bs(\d{1,2})[ .]*e(\d{1,2})\b', 2, 3),
+        (r'(?i)(.*?)[ .]*\b(\d{1,2})x(\d{1,2})\b', 2, 3),
     ]
-
-    for p in patterns:
-        m = p.search(clean_base)
-        if not m:
-            continue
-
-        gd = m.groupdict()
-        ep = gd.get('episode')
-        try:
-            season = int(gd.get('season'))
-            episode = int(ep) if ep else None
-        except (TypeError, ValueError):
-            continue
-
-        title_raw = gd.get('title') if gd.get('title') is not None else clean_base[:m.start()]
-        title = clean_title(title_raw)
-        title = normalize_tv_title(title)  # Remove years from TV titles
-        if not title or episode is None:
-            continue
-
-        return (title, season, episode)
-
+    for pat, s_idx, e_idx in patterns:
+        m = re.search(pat, clean)
+        if m:
+            title_part = m.group(1).strip()
+            try:
+                s, e = int(m.group(s_idx)), int(m.group(e_idx))
+                if 1 <= s <= 250 and 1 <= e <= 250:
+                    title_part = re.sub(r'\s+(19\d{2}|20\d{2})$', '', title_part).strip()
+                    if not title_part: continue
+                    return ' '.join(title_part.split()), s, e
+            except: continue
     return None
 
-def detect_movie(filename: str) -> Optional[Tuple[str, Optional[int]]]:
-    base = Path(filename).stem
-    clean_base = sanitize_for_matching(base)
-    m = year_pattern.search(clean_base)
-    year = None
-    title_part = clean_base
-    if m:
-        try:
-            year = int(m.group(1))
-            current_year = datetime.datetime.now().year
-            if not (1900 <= year <= current_year + 1):
-                year = None
-            else:
-                title_part = clean_base[:m.start()]
-        except ValueError:
-            year = None
+def parse_movie(name: str) -> Optional[Tuple[str, Optional[int]]]:
+    base = Path(name).stem
+    clean = sanitize_name_for_parsing(base)
+    m = YEAR_PATTERN.search(clean)
+    if not m: return clean.strip() or None, None
+    year = int(m.group(0))
+    if not (1900 <= year <= datetime.now().year + 2): return clean.strip(), None
+    return clean[:m.start()].strip() or None, year
 
-    title = clean_title(title_part)
-    if not title:
-        return None
-    return (title, year)
+def get_quality_score(filename: str) -> int:
+    s = filename.lower()
+    for q in [2160, 1080, 720, 480]:
+        if str(q) in s or (q == 2160 and "4k" in s): return q
+    return 0
 
-# ---------------------------------------------------------
-# QUALITY DETECTION
-# ---------------------------------------------------------
-
-def get_resolution(filename: str) -> int:
-    """
-    Extract resolution from filename and return as integer for comparison.
-    Returns: 2160, 1080, 720, 480, or 0 if unknown
-    """
-    filename_lower = filename.lower()
+# ────────────────────────────────────────────────
+# Core processing logic
+# ────────────────────────────────────────────────
+def handle_tv_show(src: Path, title: str, season: int, episode: int) -> bool:
+    target_dir = TV_ROOT / title / f"Season {season:02d}"
+    safe_mkdir(target_dir)
+    dest_path = target_dir / f"{title.replace(' ', '.')}.S{season:02d}E{episode:02d}{src.suffix}"
     
-    if '2160p' in filename_lower or '4k' in filename_lower or 'uhd' in filename_lower:
-        return 2160
-    elif '1080p' in filename_lower:
-        return 1080
-    elif '720p' in filename_lower:
-        return 720
-    elif '480p' in filename_lower:
-        return 480
-    
-    return 0  # Unknown quality
-
-# ---------------------------------------------------------
-# PROCESSING
-# ---------------------------------------------------------
-
-def process_tv(src: str, title: str, season: int, episode: int) -> None:
-    season_folder = f"Season {season:02d}"
-    dest_dir = os.path.join(TV_ROOT, title, season_folder)
-    safe_makedirs(dest_dir)
-    
-    # Get resolution of new file
-    new_resolution = get_resolution(Path(src).name)
-    
-    # Check for existing episodes (any extension)
-    existing_pattern = f"{title.replace(' ', '.')}.S{season:02d}E{episode:02d}.*"
-    existing_files = []
-    
-    if os.path.exists(dest_dir):
-        existing_files = [f for f in Path(dest_dir).glob(existing_pattern) if f.is_file()]
-    
-    # Compare quality with existing files
-    should_process = True
-    for existing in existing_files:
-        existing_res = get_resolution(existing.name)
-        
-        if new_resolution > existing_res:
-            # New file is better quality - delete old one
-            log(f"[UPGRADE] {new_resolution}p > {existing_res}p, replacing {existing.name}")
-            if not DRY_RUN:
-                try:
-                    os.remove(existing)
-                    log(f"[DELETED] {existing}")
-                except Exception as e:
-                    log(f"[ERROR] Could not delete {existing}: {e}")
-        elif new_resolution == existing_res:
-            # Same quality - skip
-            log(f"[SKIP] Already have {existing_res}p version of S{season:02d}E{episode:02d}")
-            should_process = False
-            break
-        else:
-            # Existing is better quality - skip new file
-            log(f"[SKIP] Existing {existing_res}p is better than new {new_resolution}p")
-            should_process = False
-            break
-    
-    # Only process if we should (either new episode or upgrade)
-    if not should_process:
-        return
-    
-    dest_name = f"{title.replace(' ', '.')}.S{season:02d}E{episode:02d}{Path(src).suffix}"
-    dest_path = os.path.join(dest_dir, dest_name)
-    create_hardlink(src, dest_path)
-    
-    # Log to database
-    log_processed_media(Path(src).name, title, "TV", season, episode, None, dest_path)
-    
-    # Send WhatsApp notification (with quality info if upgrade)
-    quality_suffix = f" ({new_resolution}p)" if new_resolution > 0 else ""
-    upgrade_suffix = " [UPGRADED]" if existing_files else ""
-    details = f"S{season:02d}E{episode:02d}{quality_suffix}{upgrade_suffix}"
-    send_whatsapp_notification(title, "TV Show", details)
-
-def process_movie(src: str, title: str, year: Optional[int]) -> None:
-    folder_name = f"{title} ({year})" if year else title
-    dest_dir = os.path.join(MOVIE_ROOT, folder_name)
-    safe_makedirs(dest_dir)
-    base_name = f"{title.replace(' ', '.')}"
-    if year:
-        base_name += f".{year}"
-    dest_name = base_name + Path(src).suffix
-    dest_path = os.path.join(dest_dir, dest_name)
-    create_hardlink(src, dest_path)
-    
-    # Log to database
-    log_processed_media(Path(src).name, title, "Movie", None, None, year, dest_path)
-    
-    # Send WhatsApp notification
-    details = f"({year})" if year else "Year unknown"
-    send_whatsapp_notification(title, "Movie", details)
-
-def process_file(path: str) -> bool:
-    """
-    Process a file and return True if successfully handled.
-    Returns False if file should be retried later.
-    """
-    filename = Path(path).name
-
-    # Explicitly skip temporary/partial download files
-    if is_temporary_file(filename):
-        log(f"[SKIP] Temporary/partial file: {filename}")
-        return False
-
-    # Only consider known video file extensions
-    if not is_video_file(filename):
-        return False
-
-    if SKIP_SAMPLES and "sample" in filename.lower():
-        log(f"[SKIP] Sample file: {filename}")
-        return True  # Don't retry samples
-
-    if is_recently_modified(path, DOWNLOAD_GRACE_PERIOD):
-        log(f"[WAIT] Recently modified: {filename}")
-        return False  # Retry later when grace period expires
-
-    # Smart detection: If a clear year (19xx or 20xx) is present AND would make a valid movie,
-    # check movie first to avoid misidentifying sequels (like "Greenland 2 Migration 2026")
-    # as TV episodes (S02E26)
-    
-    movie_info = detect_movie(filename)
-    tv_info = detect_tv(filename)
-    
-    # If we have a movie with a valid year, prefer it over TV detection
-    if movie_info:
-        title, year = movie_info
-        if year is not None:  # Valid year found
-            # Double-check: does the TV detection look suspicious?
-            # If TV was detected but movie has a year, it's likely a sequel being misread
-            if tv_info:
-                tv_title, tv_season, tv_episode = tv_info
-                # If the "episode" number is suspiciously high (>50) or matches part of the year,
-                # it's probably a false positive
-                year_str = str(year)
-                if tv_episode > 50 or str(tv_episode) in year_str:
-                    log(f"[MOVIE] {filename} → {title} ({year}) [TV detection ignored: suspicious S{tv_season:02d}E{tv_episode:02d}]")
-                    process_movie(path, title, year)
-                    return True
-            
-            # Normal movie with year
-            log(f"[MOVIE] {filename} → {title} ({year})")
-            process_movie(path, title, year)
+    existing = list(target_dir.glob(f"*.S{season:02d}E{episode:02d}.*"))
+    new_q = get_quality_score(src.name)
+    for old in existing:
+        if new_q <= get_quality_score(old.name):
+            log(f"[SKIP TV] Existing quality better/equal: {old.name}")
             return True
-    
-    # If no movie with year, check TV
-    if tv_info:
-        title, season, episode = tv_info
-        log(f"[TV] {filename} → {title} S{season:02d}E{episode:02d}")
-        process_tv(path, title, season, episode)
-        return True
-    
-    # If we detected a movie but no year, use it as fallback
-    if movie_info:
-        title, year = movie_info
-        log(f"[MOVIE] {filename} → {title}" + (f" ({year})" if year else ""))
-        process_movie(path, title, year)
-        return True
+        if not DRY_RUN: old.unlink()
 
-    log(f"[UNMATCHED] {filename}")
-    return True  # Don't retry unmatched files
+    if create_or_copy_link(src, dest_path):
+        log_processed_media(src.name, title, "TV", season, episode, None, str(dest_path))
+        send_notification(title, "TV Show", f"S{season:02d}E{episode:02d} ({new_q}p)")
+        return True
+    return False
 
-def find_video_files(root_dir: str) -> list:
-    """
-    Recursively find all video files in the watch folder.
-    Returns a list of full paths to video files.
-    """
-    video_files = []
+def handle_movie(src: Path, title: str, year: Optional[int]) -> bool:
+    target_dir = MOVIE_ROOT / (f"{title} ({year})" if year else title)
+    safe_mkdir(target_dir)
+    dest_path = target_dir / (f"{title.replace(' ', '.')}{f'.{year}' if year else ''}{src.suffix}")
     
-    if not RECURSIVE_SCAN:
-        # Original behavior - only scan files directly in root_dir
-        for filename in os.listdir(root_dir):
-            full_path = os.path.join(root_dir, filename)
-            if os.path.isfile(full_path):
-                video_files.append(full_path)
+    if dest_path.exists() and already_linked(src, dest_path): return True
+    if create_or_copy_link(src, dest_path):
+        log_processed_media(src.name, title, "Movie", None, None, year, str(dest_path))
+        send_notification(title, "Movie", f"({year})" if year else "")
+        return True
+    return False
+
+def log_processed_media(orig, title, mtype, s, e, y, dest):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT INTO processed_media (original_filename, title, media_type, season, episode, year, destination_path) VALUES (?,?,?,?,?,?,?)", 
+                         (orig, title, mtype, s, e, y, dest))
+    except Exception as err: log(f"[DB ERROR] {err}")
+
+def send_notification(title, mtype, details):
+    if ENABLE_WHATSAPP and TWILIO_AVAILABLE and not DRY_RUN:
+        try:
+            Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
+                from_=f"whatsapp:{WHATSAPP_FROM}", to=f"whatsapp:{WHATSAPP_TO}",
+                body=f"🎬 {mtype} Added\n\n{title}\n{details}")
+        except Exception as err: log(f"[WA ERROR] {err}")
+
+# ────────────────────────────────────────────────
+# Main logic
+# ────────────────────────────────────────────────
+def init_database():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS processed_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, original_filename TEXT, title TEXT, 
+            media_type TEXT, season INTEGER, episode INTEGER, year INTEGER, 
+            destination_path TEXT, processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+
+def collect_video_files():
+    files = []
+    if RECURSIVE_SCAN:
+        for r, d, fs in os.walk(WATCH_FOLDER):
+            d[:] = [dn for dn in d if dn.lower() != "sample"]
+            files.extend([Path(r) / f for f in fs if is_video_file(Path(f))])
     else:
-        # New behavior - recursively scan subfolders
-        for dirpath, dirnames, filenames in os.walk(root_dir):
-            # Skip Sample folders (common in torrent releases)
-            dirnames[:] = [d for d in dirnames if d.lower() != 'sample']
-            
-            for filename in filenames:
-                full_path = os.path.join(dirpath, filename)
-                video_files.append(full_path)
+        files = [p for p in WATCH_FOLDER.iterdir() if p.is_file() and is_video_file(p)]
+    return files
+
+def try_process_file(path: Path) -> bool:
+    if looks_like_temporary_file(path.name): return False
+    if SKIP_SAMPLES and "sample" in path.name.lower(): return True
+    if file_is_still_downloading(path, DOWNLOAD_GRACE_SEC): return False
+
+    tv    = parse_tv_show(path.name)
+    movie = parse_movie(path.name)
+
+    if tv:
+        return handle_tv_show(path, *tv)
     
-    return video_files
+    if movie[0]:
+        return handle_movie(path, *movie)
 
-# ---------------------------------------------------------
-# MAIN LOOP
-# ---------------------------------------------------------
+    log(f"[UNMATCHED] {path.name}")
+    return True
 
-def main() -> None:
-    # Initialize database
-    init_db()
-    
-    log(f"Watching: {WATCH_FOLDER}")
-    log(f"Media root: {BASE_MEDIA_FOLDER}")
-    log(f"DRY RUN: {DRY_RUN}")
-    log(f"Skip samples: {SKIP_SAMPLES}")
-    log(f"Recursive scan: {RECURSIVE_SCAN}")
-    log(f"WhatsApp notifications: {ENABLE_WHATSAPP}")
-    log(f"Dashboard database: {DB_PATH}")
-
-    if not os.path.isdir(WATCH_FOLDER):
-        log(f"[ERROR] Watch folder missing: {WATCH_FOLDER}")
-        sys.exit(1)
-
-    processed = set()  # Track successfully processed files
-
-    log("Monitoring started.")
-
+def main():
+    init_database()
+    log(f"JellyLink Started | Watch: {WATCH_FOLDER} | Dry-run: {DRY_RUN}")
+    processed = set()
     try:
         while True:
-            # Find all video files (recursively if enabled)
-            video_files = find_video_files(WATCH_FOLDER)
-            
-            for full_path in video_files:
-                # Skip if already successfully processed
-                if full_path in processed:
-                    continue
-                
-                # Try to process the file
-                success = process_file(full_path)
-                
-                # Only mark as processed if successfully handled
-                # Files waiting for grace period will be retried next scan
-                if success:
-                    processed.add(full_path)
-
-            time.sleep(SCAN_INTERVAL)
+            for p in collect_video_files():
+                if p not in processed and try_process_file(p):
+                    processed.add(p)
+            time.sleep(SCAN_INTERVAL_SEC)
     except KeyboardInterrupt:
-        log("Stopped by user.")
+        log("Stopped by user")
 
 if __name__ == "__main__":
     main()

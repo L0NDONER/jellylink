@@ -1,0 +1,22 @@
+services:
+  jellylink:
+    build: .
+    container_name: jellylink
+    restart: unless-stopped
+    volumes:
+      # Map your config file
+      - ./jellylink.conf:/app/jellylink.conf:ro
+      # Map your Database to persist history
+      - ./jellylink.db:/app/jellylink.db
+      # Map your Media (Crucial: Use the same root for hardlinks to work)
+      - /home/martin/Downloads:/home/martin/Downloads
+      - /media:/media
+    environment:
+      - TZ=Europe/London
+
+########## EXPLANATION ##########
+# - Map your Downloads and Media folders 1:1. 
+# - Docker must see the same paths as the host for hardlinks to work 
+#   across the same physical mount point.
+# - 'unless-stopped' replaces your systemd restart logic.
+#################################
