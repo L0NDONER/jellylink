@@ -68,7 +68,7 @@ if args.apply:
 elif args.dry_run:
     DRY_RUN = True
 
-WATCH_FOLDER      = Path(cfg.get("DEFAULT", "WATCH_FOLDER", fallback="~/Downloads")).expanduser().resolve()
+WATCH_FOLDER = Path(cfg.get("DEFAULT", "WATCH_FOLDER", fallback="/data/downloads")).resolve()
 MEDIA_ROOT        = Path(cfg.get("DEFAULT", "MEDIA_ROOT", fallback="/media")).resolve()
 TV_ROOT           = MEDIA_ROOT / cfg.get("DEFAULT", "TV_FOLDER", fallback="TV")
 MOVIE_ROOT        = MEDIA_ROOT / cfg.get("DEFAULT", "MOVIE_FOLDER", fallback="Movies")
