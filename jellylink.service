@@ -6,8 +6,10 @@ After=network.target
 Type=simple
 User=martin
 Group=martin
-WorkingDirectory=/home/martin/jellylink
-ExecStart=/usr/bin/python3 /home/martin/jellylink/jellylink.py
+# Updated to match the current directory on your Desktop
+WorkingDirectory=/home/martin/Desktop/python
+# Updated to target the watcher.py script
+ExecStart=/usr/bin/python3 /home/martin/Desktop/python/watcher.py
 Restart=always
 RestartSec=10
 
@@ -18,7 +20,12 @@ PrivateTmp=true
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=jellylink
 
 [Install]
 WantedBy=multi-user.target
+
+########## EXPLANATION ##########
+# 1. Updated WorkingDirectory to /home/martin/Desktop/python to ensure relative imports work.
+# 2. Updated ExecStart to point specifically to watcher.py.
+# 3. Kept existing security hardening (NoNewPrivileges/PrivateTmp) as they are best practices.
+# 4. Added [Install] section which was missing in your snippet; this is required for 'systemctl enable' to work.

@@ -1,44 +1,46 @@
 # JellyLink Media Organizer
 
-Automatic media file organizer for Jellyfin/Plex. Monitors a download folder and automatically organizes TV shows and movies into a proper library structure.
+Automatic media file organizer for Jellyfin / Plex.  
+Monitors a download folder and automatically organizes TV shows and movies into a proper library structure using **hardlinks**.
 
 ## Features
 
-- ✅ Automatic TV show detection (S##E##, #x##, ### formats)
-- ✅ Movie detection with year parsing
-- ✅ Smart sequel handling (Deadpool 2, Avatar 2, etc.)
-- ✅ Quality-based upgrades (replaces 720p with 1080p)
-- ✅ Recursive folder scanning
-- ✅ WhatsApp notifications (optional)
-- ✅ SQLite database tracking
-- ✅ Systemd service support
+- 🐳 **Dockerized Deployment**  
+  Runs in an isolated container with `unless-stopped` restart policy
 
-## Installation
+- 📺 **Automatic TV Show Detection**  
+  Reliably parses S##E##, #x## and complex scene / P2P release strings
 
-1. Clone the repository
-2. Copy `jellylink.conf.example` to `jellylink.conf`
-3. Edit `jellylink.conf` with your paths
-4. Install as systemd service (optional)
+- 🎬 **Movie Detection with Year Parsing**  
+  Smart sequel handling (e.g. Deadpool 2, Batman Begins / The Dark Knight)
 
-## Usage
+- ⬆️ **Quality-based Upgrades**  
+  Automatically replaces lower quality files with better versions (e.g. 2160p > 1080p > WEBRip > HDTV)
 
-### Manual run
+- 🔄 **Cross-Device / Cross-Filesystem Support**  
+  Falls back to safe copying when hardlinking is not possible
+
+- 🗄️ **SQLite Database Tracking**  
+  Prevents redundant processing of already handled files
+
+- 📱 **WhatsApp Notifications**  
+  Real-time updates via Twilio when new media is successfully organized
+
+## Prerequisites
+
+- Docker + Docker Compose
+- A properly configured `jellylink.conf` (start with `jellylink.conf.example`)
+
+## Deployment (Recommended – Docker)
+
 ```bash
-python3 jellylink.py
-```
+# 1. Clone repository
+git clone <repository-url>
+cd jellylink
 
-### Systemd service
-```bash
-sudo cp jellylink.service /etc/systemd/system/
-sudo systemctl enable jellylink
-sudo systemctl start jellylink
-```
+# 2. Create and edit configuration
+cp jellylink.conf.example jellylink.conf
+# → edit jellylink.conf with your paths & Twilio credentials
 
-## Recent Fixes
-
-- Fixed sequel movie detection (movies with years now prioritized over false TV matches)
-- Added suspicious episode detection (episode >50 or in year digits)
-
-## License
-
-Personal project - use at your own risk
+# 3. Start (builds image if needed)
+docker compose up -d --build

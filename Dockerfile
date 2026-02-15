@@ -1,22 +1,24 @@
-# Use a lightweight Python base
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim
 
-# Set working directory inside the container
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
-# Copy dependency list and install
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# tini for clean PID1 + signal handling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tini \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy the script into the container
-COPY jellylink.py .
+# Install deps first for better layer caching
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Run the script with the apply flag by default
-# We use the config file via a volume mount
-CMD ["python", "jellylink.py", "--apply"]
+# Copy the app code (keep conf/db mounted from host)
+COPY jellylink.py /app/jellylink.py
 
-########## EXPLANATION ##########
-# - Uses slim-debian base to keep the image small.
-# - Installs only necessary dependencies.
-# - Expects the config and media to be mounted as volumes.
-#################################
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "/app/jellylink.py"]
+

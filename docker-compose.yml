@@ -1,22 +1,39 @@
 services:
   jellylink:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: jellylink
     restart: unless-stopped
-    volumes:
-      # Map your config file
-      - ./jellylink.conf:/app/jellylink.conf:ro
-      # Map your Database to persist history
-      - ./jellylink.db:/app/jellylink.db
-      # Map your Media (Crucial: Use the same root for hardlinks to work)
-      - /home/martin/Downloads:/home/martin/Downloads
-      - /media:/media
+
+    # Matches your host user 'martin' (UID 1000)
+    user: "1000:1000"
     environment:
-      - TZ=Europe/London
+      - PYTHONUNBUFFERED=1
+
+    working_dir: /app
+
+    volumes:
+      # THE SPEED FIX:
+      # Map the entire media root. Move your 'downloads' folder here 
+      # on the host (mv /data/downloads /media/downloads).
+      - /media:/media:rw
+      
+      # The project directory where jellylink.conf and jellylink.db live.
+      # If processed.db is in the downloads folder, it will be found 
+      # under /media/downloads/processed.db.
+      - .:/app:rw
+
+    read_only: false
+    tmpfs:
+      - /tmp
 
 ########## EXPLANATION ##########
-# - Map your Downloads and Media folders 1:1. 
-# - Docker must see the same paths as the host for hardlinks to work 
-#   across the same physical mount point.
-# - 'unless-stopped' replaces your systemd restart logic.
-#################################
+# 1. Database Persistence: Jellylink uses 'jellylink.db' in the /app 
+#    folder and looks for 'processed.db' in the watch directory. 
+#    By mounting '.' to '/app', your primary DB stays safe.
+# 2. Migration Step: You must move 'processed.db' from '/data/downloads' 
+#    to '/media/downloads' on the host so Jellylink recognizes it 
+#    after the path change.
+# 3. Path Logic: Within your jellylink.conf, you will change the 
+#    watch_dir to '/media/downloads'.

@@ -1,193 +1,251 @@
-# JellyLink systemd Service Setup
+🎬 JellyLink
 
-## Quick Install
+Event-driven media ingestion engine with fast-path parsing, idempotent linking, and intelligent retry scheduling.
 
-1. Copy the files to your JellyLink directory:
-```bash
-cd /home/martin/jellylink
-# Copy jellylink.py and jellylink.service here
-```
+JellyLink watches a download directory, parses media files, and links them into a clean Jellyfin-ready library structure — efficiently, deterministically, and without unnecessary disk duplication.
 
-2. Run the installer:
-```bash
-chmod +x install-systemd-service.sh
-./install-systemd-service.sh
-```
+✨ Features
 
-That's it! JellyLink will now:
-- ✅ Start automatically on boot
-- ✅ Run in the background
-- ✅ Restart automatically if it crashes
-- ✅ Log to systemd journal
+👀 Recursive filesystem watcher (watchdog-based)
 
-## Manual Installation (if you prefer)
+⚡ Fast-path regex parsing for common scene TV releases
 
-If you don't want to use the script:
+🧠 Fallback parsing via guessit for edge cases
 
-```bash
-# Copy service file
-sudo cp jellylink.service /etc/systemd/system/
+🔁 Exponential retry scheduler for incomplete downloads
 
-# Reload systemd
-sudo systemctl daemon-reload
+🗃 SQLite fingerprint deduplication
 
-# Enable (start on boot)
-sudo systemctl enable jellylink
+🔗 Hardlink-first linking (instant when on same mount)
 
-# Start now
-sudo systemctl start jellylink
+📦 Safe copy fallback when linking is not possible
 
-# Check status
-sudo systemctl status jellylink
-```
+🧹 Automatic cleanup of empty download folders
 
-## Daily Usage Commands
+📲 Optional Telegram notifications
 
-### View Status
-```bash
-sudo systemctl status jellylink
-```
+🧵 Multi-worker concurrent processing
 
-### View Live Logs
-```bash
-sudo journalctl -u jellylink -f
-```
+🛡 Idempotent + crash-safe design
 
-### View Recent Logs
-```bash
-sudo journalctl -u jellylink -n 100
-```
+🧱 Architecture
+Downloads
+   ↓
+Watchdog Event
+   ↓
+Scheduler (dedupe + retry)
+   ↓
+Worker Pool
+   ↓
+Parser (regex → guessit fallback)
+   ↓
+Hardlink Engine
+   ↓
+SQLite Log
+   ↓
+Telegram Notification (optional)
 
-### Restart Service
-```bash
-sudo systemctl restart jellylink
-```
 
-### Stop Service
-```bash
-sudo systemctl stop jellylink
-```
+JellyLink is built as a long-running, resilient ingestion service — not a one-shot script.
 
-### Start Service
-```bash
-sudo systemctl start jellylink
-```
+⚡ Why Hardlinking?
 
-### Disable Auto-Start
-```bash
-sudo systemctl disable jellylink
-```
+If your download directory and media library are on the same filesystem:
 
-### Enable Auto-Start
-```bash
-sudo systemctl enable jellylink
-```
+🔗 Linking takes milliseconds
 
-## Troubleshooting
+💾 No duplicate storage
 
-### Service won't start
-Check the logs:
-```bash
-sudo journalctl -u jellylink -n 50 --no-pager
-```
+🌱 Torrents continue seeding
 
-Common issues:
-- **Path incorrect**: Edit `/etc/systemd/system/jellylink.service` and fix paths
-- **Permissions**: Ensure martin user can read jellylink.py
-- **Config file**: Make sure jellylink.conf exists in the same directory
+📺 Jellyfin sees the file instantly
 
-### After making changes
-If you edit jellylink.service:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart jellylink
-```
+If hardlinking fails, JellyLink automatically falls back to copy2() safely.
 
-### View service file
-```bash
-cat /etc/systemd/system/jellylink.service
-```
+🧠 Parsing Strategy
 
-### Edit service file
-```bash
-sudo nano /etc/systemd/system/jellylink.service
-# After saving:
-sudo systemctl daemon-reload
-sudo systemctl restart jellylink
-```
+JellyLink uses a two-stage parsing approach:
 
-## What the Service Does
+Fast Regex Path
 
-- **Runs as**: User `martin` (not root - safer)
-- **Working directory**: `/home/martin/jellylink`
-- **Starts**: Automatically on boot
-- **Restarts**: Automatically if it crashes (after 10 seconds)
-- **Logs**: To systemd journal (view with `journalctl`)
+Handles 80–90% of common scene releases (S01E01, 01x01, etc.)
 
-## Service File Location
+Avoids heavy parsing overhead.
 
-The service file will be installed to:
-```
-/etc/systemd/system/jellylink.service
-```
+Guessit Fallback
 
-## Uninstallation
+Catches edge cases and unusual naming.
 
-To remove the systemd service:
+Acts as the “receptor” for irregular files.
 
-```bash
-# Stop the service
-sudo systemctl stop jellylink
+This keeps performance high while maintaining coverage.
 
-# Disable auto-start
-sudo systemctl disable jellylink
+🔁 Intelligent Retry System
 
-# Remove service file
-sudo rm /etc/systemd/system/jellylink.service
+Files still downloading?
 
-# Reload systemd
-sudo systemctl daemon-reload
-```
+JellyLink detects instability (size + mtime check) and:
 
-## Customization
+Returns "retry"
 
-Edit `/etc/systemd/system/jellylink.service` to customize:
+Applies exponential backoff
 
-- **User/Group**: Change `martin` to your username
-- **WorkingDirectory**: Change if jellylink is in a different location
-- **ExecStart**: Change path to jellylink.py or add arguments
-- **Restart policy**: Change `RestartSec=10` to a different value
+Stops retrying after configurable max attempts
 
-After editing, always run:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart jellylink
-```
+No blocking.
+No spin loops.
+No duplicate work.
 
-## Checking If It's Running
+🗃 Idempotency & Deduplication
 
-Quick check:
-```bash
-systemctl is-active jellylink
-# Should output: active
-```
+Each file is fingerprinted and stored in SQLite.
 
-Or full status:
-```bash
-sudo systemctl status jellylink
-```
+Even if:
 
-Look for:
-- **Active: active (running)** ✅
-- **Active: inactive (dead)** ❌
-- **Active: failed** ❌
+Watchdog fires multiple events
 
-## Log Files
+Multiple workers overlap
 
-JellyLink logs to both:
-1. **Systemd journal**: `sudo journalctl -u jellylink -f`
-2. **Log file** (if configured in jellylink.conf): Check `LOG_FILE` setting
+The service restarts
 
----
+The same file will not be processed twice.
 
-**Note**: The install script assumes JellyLink is in `/home/martin/jellylink`. If yours is elsewhere, edit the paths in `jellylink.service` before installing.
+Destination existence is treated as success.
+
+🐳 Docker Deployment
+docker-compose up -d
+
+
+Reproducible runtime
+
+Volume-mounted media paths
+
+Clean container lifecycle
+
+Built from Git source of truth
+
+🖥 Systemd Deployment
+
+See SYSTEMD_GUIDE.md for full setup instructions.
+
+Highlights:
+
+Starts on boot
+
+Auto-restarts on crash
+
+Logs via journalctl
+
+Runs as non-root user
+
+📲 Telegram Notifications
+
+Optional and configurable in jellylink.conf.
+
+When enabled:
+
+Sends notification when media is added
+
+Displays show/movie name and episode/date
+
+Silent when DRY_RUN is enabled
+
+🧪 Configuration
+
+Main configuration file:
+
+jellylink.conf
+
+
+Key settings:
+
+WATCH_FOLDER
+
+MEDIA_ROOT
+
+TV_FOLDER
+
+MOVIE_FOLDER
+
+DRY_RUN
+
+Retry/backoff tuning
+
+Telegram credentials
+
+📦 Requirements
+
+Python 3.10+
+
+Linux (tested on Mint / Debian-based systems)
+
+Same filesystem mount for hardlink optimization
+
+Jellyfin library pointed to MEDIA_ROOT
+
+Dependencies are listed in requirements.txt.
+
+🧘 Design Philosophy
+
+JellyLink was built with the following principles:
+
+Deterministic behavior
+
+Safe iteration
+
+Idempotent operations
+
+Minimal disk churn
+
+Observable logging
+
+Long-running stability
+
+It favors clarity and resilience over feature sprawl.
+
+🏷 Versioning & Stability
+
+Stable states are tagged in Git:
+
+v0.x-stable-live
+
+
+Running deployments map directly to tagged commits.
+
+Rollback is instant and reproducible.
+
+❓ Why Not Sonarr / Radarr?
+
+JellyLink is not intended to replace full-feature media managers.
+
+It exists for:
+
+Full local control
+
+Privacy
+
+Minimal external dependencies
+
+Deterministic ingestion
+
+Learning and experimentation
+
+Custom parsing logic
+
+It is an ingestion engine, not a metadata manager.
+
+🚧 Status
+
+✅ Stable hardlink workflow
+
+✅ Idempotent destination handling
+
+✅ Concurrent scheduler verified
+
+✅ Telegram integration working
+
+🔄 Regex refinements ongoing
+
+📜 License
+
+Choose your preferred open-source license (MIT recommended for simplicity).

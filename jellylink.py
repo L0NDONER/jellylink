@@ -1,332 +1,508 @@
 #!/usr/bin/env python3
-# jellylink.py
-# Purpose:    GitOps-friendly media organizer using hardlinks
-#             TV / Movies → structured folders with quality-based deduplication
+"""
+jellylink.py - watcher + media processor
 
-import os
-import re
-import sys
-import time
-import argparse
+Design notes:
+- Fast-path regex parses common scene TV releases without calling guessit.
+- If the file isn't stable (still being written), return "retry" so the
+  scheduler handles backoff without blocking worker threads.
+- SQLite fingerprint dedupe prevents repeated work.
+"""
+
+from __future__ import annotations
+
 import configparser
+import hashlib
+import heapq
 import logging
-import sqlite3
+import os
+import queue
+import re
 import shutil
-import errno
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, List, Set
-from datetime import datetime
+from typing import Dict, Optional, Set, Tuple
 
-# Optional WhatsApp dependency
-try:
-    from twilio.rest import Client
-    TWILIO_AVAILABLE = True
-except ImportError:
-    TWILIO_AVAILABLE = False
+import requests
+from guessit import guessit
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
-########## 
-# EXPLANATION: 
-# Refined the Logging section to be "Docker-safe."
-# It now checks if the directory for LOG_FILE exists before trying to open it.
-# If it fails (e.g., due to a missing mount or path), it falls back to 
-# standard console output so the container doesn't crash with FileNotFoundError.
-##########
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-5s] %(message)s",
+)
+log = logging.getLogger("JellyLink")
 
-# ────────────────────────────────────────────────
-# Argument parser
-# ────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="JellyLink – declarative media organizer")
-parser.add_argument("--config", default=None, help="Override default config location")
-parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode")
-parser.add_argument("--apply", action="store_true", help="Force apply mode (overrides dry-run)")
-args = parser.parse_args()
-
-# ────────────────────────────────────────────────
-# Configuration
-# ────────────────────────────────────────────────
-script_dir = Path(__file__).resolve().parent
-default_config = script_dir / "jellylink.conf"
-config_path = Path(args.config) if args.config else default_config
-
-if not config_path.is_file():
-    print(f"ERROR: Config file not found: {config_path}", file=sys.stderr)
-    sys.exit(2)
+# ---------------- Config ----------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SCRIPT_DIR / "jellylink.conf"
 
 cfg = configparser.ConfigParser()
-cfg.read(config_path)
+cfg.read(DEFAULT_CONFIG)
+
 
 def getbool(section: str, key: str, fallback: str = "false") -> bool:
-    return cfg.get(section, key, fallback=fallback).strip().lower() in {"1", "true", "yes", "on"}
+    """Parse booleans from config safely."""
+    value = cfg.get(section, key, fallback=fallback).strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
-DRY_RUN           = getbool("DEFAULT", "DRY_RUN", "true")
-RECURSIVE_SCAN    = getbool("DEFAULT", "RECURSIVE_SCAN", "true")
-SKIP_SAMPLES      = getbool("DEFAULT", "SKIP_SAMPLES", "true")
-ENABLE_WHATSAPP   = getbool("DEFAULT", "ENABLE_WHATSAPP", "false")
 
-if args.apply:
-    DRY_RUN = False
-elif args.dry_run:
-    DRY_RUN = True
+DRY_RUN = getbool("DEFAULT", "DRY_RUN", "true")
 
-WATCH_FOLDER = Path(cfg.get("DEFAULT", "WATCH_FOLDER", fallback="/data/downloads")).resolve()
-MEDIA_ROOT        = Path(cfg.get("DEFAULT", "MEDIA_ROOT", fallback="/media")).resolve()
-TV_ROOT           = MEDIA_ROOT / cfg.get("DEFAULT", "TV_FOLDER", fallback="TV")
-MOVIE_ROOT        = MEDIA_ROOT / cfg.get("DEFAULT", "MOVIE_FOLDER", fallback="Movies")
+WATCH_FOLDER = Path(cfg.get("DEFAULT", "WATCH_FOLDER", fallback="/media/downloads")).resolve()
+MEDIA_ROOT = Path(cfg.get("DEFAULT", "MEDIA_ROOT", fallback="/media")).resolve()
+TV_ROOT = MEDIA_ROOT / cfg.get("DEFAULT", "TV_FOLDER", fallback="TV")
+MOVIE_ROOT = MEDIA_ROOT / cfg.get("DEFAULT", "MOVIE_FOLDER", fallback="Movies")
 
-DOWNLOAD_GRACE_SEC = cfg.getint("DEFAULT", "DOWNLOAD_GRACE_PERIOD", fallback=60)
-SCAN_INTERVAL_SEC  = cfg.getint("DEFAULT", "SCAN_INTERVAL", fallback=15)
-LOG_FILE_PATH      = cfg.get("DEFAULT", "LOG_FILE", fallback="").strip()
+DOWNLOAD_GRACE_SEC = cfg.getint("DEFAULT", "DOWNLOAD_GRACE_PERIOD", fallback=120)
 
-TWILIO_SID    = cfg.get("DEFAULT", "TWILIO_ACCOUNT_SID", fallback="")
-TWILIO_TOKEN  = cfg.get("DEFAULT", "TWILIO_AUTH_TOKEN", fallback="")
-WHATSAPP_FROM = cfg.get("DEFAULT", "TWILIO_WHATSAPP_FROM", fallback="+14155238886")
-WHATSAPP_TO   = cfg.get("DEFAULT", "WHATSAPP_TO", fallback="")
+MAX_WORKERS = int(os.getenv("JELLYWATCH_WORKERS", "3"))
+DEDUPE_WINDOW_SEC = int(os.getenv("JELLYWATCH_DEDUPE_SEC", "30"))
+RETRY_BASE_SEC = int(os.getenv("JELLYWATCH_RETRY_BASE", "45"))
+RETRY_MAX_SEC = int(os.getenv("JELLYWATCH_RETRY_MAX", "20000"))
+MAX_RETRIES = int(os.getenv("JELLYWATCH_MAX_RETRIES", "30"))
 
-DB_PATH = script_dir / "jellylink.db"
+TELEGRAM_BOT_TOKEN = cfg.get("DEFAULT", "TELEGRAM_BOT_TOKEN", fallback="").strip()
+TELEGRAM_CHAT_ID = cfg.get("DEFAULT", "TELEGRAM_CHAT_ID", fallback="").strip()
+ENABLE_TELEGRAM = getbool("DEFAULT", "ENABLE_TELEGRAM", "false")
 
-if ENABLE_WHATSAPP and TWILIO_AVAILABLE:
-    if not all([TWILIO_SID, TWILIO_TOKEN, WHATSAPP_TO]):
-        print("ERROR: WhatsApp enabled but missing Twilio credentials", file=sys.stderr)
-        sys.exit(3)
+DB_PATH = SCRIPT_DIR / "jellylink.db"
 
-# ────────────────────────────────────────────────
-# Logging setup
-# ────────────────────────────────────────────────
-log_kwargs = {
-    "level": logging.INFO,
-    "format": "%(asctime)s [%(levelname)-5s] %(message)s",
-    "datefmt": "%Y-%m-%d %H:%M:%S",
-    "handlers": [logging.StreamHandler(sys.stdout)] # Always log to console for Docker
-}
+VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm"}
 
-if LOG_FILE_PATH:
-    try:
-        p = Path(LOG_FILE_PATH)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # Add file handler if path is valid
-        log_kwargs["handlers"].append(logging.FileHandler(p, mode='a'))
-    except Exception as e:
-        print(f"WARNING: Could not initialize log file at {LOG_FILE_PATH}: {e}")
-        print("Falling back to console-only logging.")
+# ---------------- Fast-Path Regex ----------------
+TV_PATTERNS = [
+    re.compile(
+        r"(?i)^(?P<title>.+?)[ ._\-]+s(?P<season>\d{1,2})[ ._\-]*e(?P<episode>\d{1,2})\b"
+    ),  # S01E01
+    re.compile(
+        r"(?i)^(?P<title>.+?)[ ._\-]+(?P<season>\d{1,2})x(?P<episode>\d{1,2})\b"
+    ),  # 01x01
+]
 
-logging.basicConfig(**log_kwargs)
-
-def log(msg: str) -> None:
-    logging.info(msg)
-
-# ────────────────────────────────────────────────
-# Constants & Patterns
-# ────────────────────────────────────────────────
-VIDEO_EXTENSIONS  = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm"}
-TEMPORARY_SUFFIXES = {".part", ".crdownload", ".!ut", ".!qb", ".aria2", ".partial", ".tmp"}
-
-COMMON_RELEASE_TAGS = re.compile(
-    r'\b(?:2160p|1080p|720p|480p|4k|uhd|webdl|webrip|web|web-?dl|web-?rip|'
-    r'hdr|hevc|h265|h264|x265|x264|ddp|dd\+|aac|mp3|amzn|nf|pmtp|10bit|8bit)\b',
-    flags=re.IGNORECASE
+SCENE_JUNK_RE = re.compile(
+    r"(?i)\b(1080p|720p|2160p|hdtv|h\.?264|x264|hevc|x265|web[- .]?dl|webrip|bluray|brrip)\b.*$"
 )
 
-YEAR_PATTERN = re.compile(r"(19[0-9]{2}|20[0-9]{2})")
 
-# ────────────────────────────────────────────────
-# Utilities
-# ────────────────────────────────────────────────
-def is_video_file(p: Path) -> bool:
-    return p.suffix.lower() in VIDEO_EXTENSIONS
+def fast_parse_tv(filename: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    """Instant regex match to bypass guessit for standard TV releases."""
+    for pattern in TV_PATTERNS:
+        match = pattern.search(filename)
+        if not match:
+            continue
 
-def looks_like_temporary_file(name: str) -> bool:
-    ln = name.lower()
-    return any(ln.endswith(s) for s in TEMPORARY_SUFFIXES) or ".!qb" in ln or ".!ut" in ln
+        raw_title = match.group("title")
+        raw_title = raw_title.replace(".", " ").replace("_", " ").strip()
 
-def file_is_still_downloading(p: Path, grace_seconds: int) -> bool:
+        # Strip common scene suffix junk that sometimes bleeds into title
+        title = SCENE_JUNK_RE.sub("", raw_title).strip()
+
+        try:
+            season = int(match.group("season"))
+            episode = int(match.group("episode"))
+        except (ValueError, TypeError):
+            continue
+
+        return (title or raw_title), season, episode
+
+    return None, None, None
+
+
+def load_daily_titles() -> Set[str]:
+    raw = cfg.get("DEFAULT", "DAILY_SHOW_TITLES", fallback="").strip()
+    if not raw:
+        return {
+            "the daily show",
+            "the tonight show starring jimmy fallon",
+            "late night with seth meyers",
+            "jimmy kimmel live",
+            "the late show with stephen colbert",
+            "last week tonight with john oliver",
+        }
+    titles: Set[str] = set()
+    for part in raw.split(","):
+        t = part.strip().lower()
+        if t:
+            titles.add(t)
+    return titles
+
+
+DAILY_SHOW_TITLES = load_daily_titles()
+
+# ---------------- DB ----------------
+def get_file_fingerprint(path: Path) -> str:
+    """Stable-ish fingerprint: name + size + mtime, hashed."""
     try:
-        return (time.time() - p.stat().st_mtime) < grace_seconds
-    except (FileNotFoundError, PermissionError):
-        return True
+        s = path.stat()
+        seed = f"{path.name}{s.st_size}{s.st_mtime}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    except Exception:
+        return hashlib.sha256(str(path).encode("utf-8")).hexdigest()
 
-def safe_mkdir(d: Path) -> None:
-    if DRY_RUN:
-        log(f"[DRY] Would mkdir: {d}")
-        return
-    d.mkdir(parents=True, exist_ok=True)
 
-def already_linked(src: Path, dst: Path) -> bool:
-    if not dst.exists(): return False
+def init_database() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_filename TEXT,
+                source_fingerprint TEXT NOT NULL UNIQUE,
+                title TEXT,
+                media_type TEXT,
+                season INTEGER,
+                episode INTEGER,
+                year INTEGER,
+                destination_path TEXT,
+                processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+
+def already_processed(path: Path) -> bool:
+    fp = get_file_fingerprint(path)
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM processed_media WHERE source_fingerprint=? LIMIT 1",
+            (fp,),
+        )
+        return cur.fetchone() is not None
+
+
+def log_processed_media(
+    src_path: Path,
+    title: str,
+    mtype: str,
+    season: Optional[int],
+    episode: Optional[int],
+    year: Optional[int],
+    dest: str,
+) -> None:
+    fingerprint = get_file_fingerprint(src_path)
     try:
-        s_stat, d_stat = src.stat(), dst.stat()
-        return s_stat.st_ino == d_stat.st_ino and s_stat.st_dev == d_stat.st_dev
-    except Exception: return False
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                INSERT INTO processed_media
+                    (original_filename, source_fingerprint, title, media_type, season, episode, year, destination_path)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (src_path.name, fingerprint, str(title), mtype, season, episode, year, dest),
+            )
+    except sqlite3.IntegrityError:
+        log.info("[SKIP] already in DB: %s", src_path.name)
+    except Exception as err:
+        log.error("[DB ERROR] %s", err)
 
-def create_or_copy_link(src: Path, dst: Path) -> bool:
-    if already_linked(src, dst):
-        log(f"[SKIP] Already hardlinked: {dst.name}")
-        return True
+
+# ---------------- IO helpers ----------------
+def create_link(src: Path, dst: Path) -> bool:
+    """
+    Create a hardlink (fast) with safe/idempotent behavior.
+
+    - If dst already exists, treat as success (prevents re-copying large files).
+    - If hardlink fails for other reasons, fall back to copy2.
+    """
+    # If destination exists, avoid hardlink/copy churn.
+    if dst.exists():
+        try:
+            src_size = src.stat().st_size
+            dst_size = dst.stat().st_size
+            if src_size == dst_size and src_size > 0:
+                log.info("[SKIP] Destination already exists: %s", dst)
+                return True
+            log.warning("[SKIP] Destination exists but size differs: %s", dst)
+            return False
+        except Exception:
+            log.info("[SKIP] Destination already exists (stat failed): %s", dst)
+            return True
+
     if DRY_RUN:
-        log(f"[DRY] Would link/copy: {src.name} → {dst}")
+        log.info("[DRY-RUN] Would link %s -> %s", src, dst)
         return True
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".jl-tmp")
     try:
-        os.link(src, tmp)
-        tmp.rename(dst)
-        log(f"[LINK] {src.name} → {dst}")
+        os.link(src, dst)
+        log.info("[LINK] %s -> %s", src.name, dst)
+        return True
+    except FileExistsError:
+        # Race between workers or repeated events.
+        log.info("[SKIP] Destination already exists (race): %s", dst)
         return True
     except OSError as e:
-        if e.errno != errno.EXDEV:
-            log(f"[ERROR] Hardlink failed: {e}")
+        # This is the 'Production' way to debug I/O
+        log.warning(
+            "[LINK FAIL] Could not hardlink (%s). Falling back to COPY. "
+            "Check if src/dest are on same mount!",
+            e,
+        )
+        try:
+            shutil.copy2(src, dst)
+            log.info("[COPY] %s -> %s", src.name, dst)
+            return True
+        except Exception as err:
+            log.error("[ERROR] Copy failed: %s", err)
             return False
+
+
+def cleanup_empty_dirs(path: Path) -> None:
+    if not path.is_dir() or path == WATCH_FOLDER:
+        return
     try:
-        shutil.copy2(src, tmp)
-        tmp.rename(dst)
-        log(f"[COPY] {src.name} → {dst} (cross-device)")
-        return True
-    except Exception as e:
-        log(f"[ERROR] Copy failed: {e}")
-        if tmp.exists(): tmp.unlink()
+        if not any(path.iterdir()):
+            log.info("[CLEANUP] Removing empty dir: %s", path)
+            path.rmdir()
+            cleanup_empty_dirs(path.parent)
+    except Exception as err:
+        log.error("[CLEANUP ERROR] %s", err)
+
+
+def send_notification(title: str, mtype: str, details: str) -> None:
+    if DRY_RUN or not (ENABLE_TELEGRAM and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+
+    msg = f"🎬 {mtype} Added\n\n{title}\n{details}"
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as err:
+        log.error("[TG ERROR] %s", err)
+
+
+# ---------------- Non-Blocking Stability Check ----------------
+def check_stability_instant(path: Path) -> bool:
+    """Check if file is currently being written to by comparing mtime/size briefly."""
+    try:
+        s1 = path.stat()
+        time.sleep(0.5)
+        s2 = path.stat()
+        return (s1.st_size == s2.st_size) and (s1.st_mtime == s2.st_mtime) and (s1.st_size > 0)
+    except FileNotFoundError:
         return False
 
-# ────────────────────────────────────────────────
-# Parsing logic
-# ────────────────────────────────────────────────
-def sanitize_name_for_parsing(name: str) -> str:
-    s = re.sub(r'[._-]+', ' ', name)
-    s = COMMON_RELEASE_TAGS.sub(' ', s)
-    return re.sub(r'\s+', ' ', s).strip()
 
-def parse_tv_show(name: str) -> Optional[Tuple[str, int, int]]:
-    base = Path(name).stem
-    clean = sanitize_name_for_parsing(base)
-    patterns = [
-        (r'(?i)(.*?)[ .]*\bs(\d{1,2})[ .]*e(\d{1,2})\b', 2, 3),
-        (r'(?i)(.*?)[ .]*\b(\d{1,2})x(\d{1,2})\b', 2, 3),
-    ]
-    for pat, s_idx, e_idx in patterns:
-        m = re.search(pat, clean)
-        if m:
-            title_part = m.group(1).strip()
-            try:
-                s, e = int(m.group(s_idx)), int(m.group(e_idx))
-                if 1 <= s <= 250 and 1 <= e <= 250:
-                    title_part = re.sub(r'\s+(19\d{2}|20\d{2})$', '', title_part).strip()
-                    if not title_part: continue
-                    return ' '.join(title_part.split()), s, e
-            except: continue
-    return None
+# ---------------- Processing ----------------
+def process_file(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    if path.suffix.lower() not in VIDEO_EXTENSIONS:
+        return "ignored"
 
-def parse_movie(name: str) -> Optional[Tuple[str, Optional[int]]]:
-    base = Path(name).stem
-    clean = sanitize_name_for_parsing(base)
-    m = YEAR_PATTERN.search(clean)
-    if not m: return clean.strip() or None, None
-    year = int(m.group(0))
-    if not (1900 <= year <= datetime.now().year + 2): return clean.strip(), None
-    return clean[:m.start()].strip() or None, year
+    name_l = path.name.lower()
+    if ".sample." in name_l or name_l.endswith("sample.mkv") or name_l.endswith("sample.mp4") or "-sample" in name_l:
+        return "ignored"
 
-def get_quality_score(filename: str) -> int:
-    s = filename.lower()
-    for q in [2160, 1080, 720, 480]:
-        if str(q) in s or (q == 2160 and "4k" in s): return q
-    return 0
-
-# ────────────────────────────────────────────────
-# Core processing logic
-# ────────────────────────────────────────────────
-def handle_tv_show(src: Path, title: str, season: int, episode: int) -> bool:
-    target_dir = TV_ROOT / title / f"Season {season:02d}"
-    safe_mkdir(target_dir)
-    dest_path = target_dir / f"{title.replace(' ', '.')}.S{season:02d}E{episode:02d}{src.suffix}"
-    
-    existing = list(target_dir.glob(f"*.S{season:02d}E{episode:02d}.*"))
-    new_q = get_quality_score(src.name)
-    for old in existing:
-        if new_q <= get_quality_score(old.name):
-            log(f"[SKIP TV] Existing quality better/equal: {old.name}")
-            return True
-        if not DRY_RUN: old.unlink()
-
-    if create_or_copy_link(src, dest_path):
-        log_processed_media(src.name, title, "TV", season, episode, None, str(dest_path))
-        send_notification(title, "TV Show", f"S{season:02d}E{episode:02d} ({new_q}p)")
-        return True
-    return False
-
-def handle_movie(src: Path, title: str, year: Optional[int]) -> bool:
-    target_dir = MOVIE_ROOT / (f"{title} ({year})" if year else title)
-    safe_mkdir(target_dir)
-    dest_path = target_dir / (f"{title.replace(' ', '.')}{f'.{year}' if year else ''}{src.suffix}")
-    
-    if dest_path.exists() and already_linked(src, dest_path): return True
-    if create_or_copy_link(src, dest_path):
-        log_processed_media(src.name, title, "Movie", None, None, year, str(dest_path))
-        send_notification(title, "Movie", f"({year})" if year else "")
-        return True
-    return False
-
-def log_processed_media(orig, title, mtype, s, e, y, dest):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT INTO processed_media (original_filename, title, media_type, season, episode, year, destination_path) VALUES (?,?,?,?,?,?,?)", 
-                         (orig, title, mtype, s, e, y, dest))
-    except Exception as err: log(f"[DB ERROR] {err}")
+        if path.stat().st_size < 50 * 1024 * 1024:
+            return "ignored"
+    except Exception:
+        return "ignored"
 
-def send_notification(title, mtype, details):
-    if ENABLE_WHATSAPP and TWILIO_AVAILABLE and not DRY_RUN:
+    if already_processed(path):
+        return "skip"
+
+    # If not stable, return 'retry' so scheduler handles backoff.
+    if not check_stability_instant(path):
+        return "retry"
+
+    # --- PHASE 1: Fast-Path Regex ---
+    title, season, ep_num = fast_parse_tv(path.name)
+    mtype: Optional[str] = "episode" if title else None
+    year: Optional[int] = None
+    date_info = None
+
+    # --- PHASE 2: Guessit Fallback ---
+    if not title:
+        info = guessit(path.name)
+        title = info.get("title")
+        if not title:
+            log.warning("[PARSE FAIL] %s", path.name)
+            return "done"
+
+        mtype = info.get("type")
+        date_info = info.get("date")
+        season = info.get("season", 1)
+        ep_num = info.get("episode")
+        year = info.get("year")
+
+        # Daily show date-based override
+        if mtype == "movie" and date_info and str(title).strip().lower() in DAILY_SHOW_TITLES:
+            mtype = "episode"
+
+    # --- PHASE 3: Pathing and IO ---
+    if mtype == "episode":
+        # Prefer episode number if present, else date, else "1"
+        if ep_num is not None:
+            ep_display = str(ep_num)
+        elif date_info is not None:
+            ep_display = date_info.strftime("%Y-%m-%d")
+        else:
+            ep_display = "1"
+
+        season_num = int(season) if season is not None else 1
+        dest = TV_ROOT / str(title) / f"Season {season_num}" / f"{title} - {ep_display}{path.suffix}"
+
+        if create_link(path, dest):
+            logged_year = date_info.year if date_info else None
+            log_processed_media(path, str(title), "TV", season_num, ep_num, logged_year, str(dest))
+            log.info("[ADDED] %s -> %s", path.name, dest)
+            send_notification(str(title), "TV Show", f"Date/Ep: {ep_display}")
+            cleanup_empty_dirs(path.parent)
+            return "added"
+
+    # Default: movie
+    folder_name = f"{title} ({year})" if year else str(title)
+    dest = MOVIE_ROOT / folder_name / f"{title}{path.suffix}"
+    if create_link(path, dest):
+        log_processed_media(path, str(title), "Movie", None, None, year, str(dest))
+        log.info("[ADDED] %s -> %s", path.name, dest)
+        send_notification(str(title), "Movie", f"({year})" if year else "")
+        cleanup_empty_dirs(path.parent)
+        return "added"
+
+    return "done"
+
+
+# ---------------- Scheduler ----------------
+@dataclass(order=True)
+class RetryItem:
+    run_at: float
+    path: Path = field(compare=False)
+    tries: int = field(compare=False, default=0)
+
+
+class Scheduler:
+    def __init__(self) -> None:
+        self.work_q: "queue.Queue[Tuple[Path, int]]" = queue.Queue()
+        self.retry_heap: list[RetryItem] = []
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.inflight: Set[Path] = set()
+        self.last_enqueued: Dict[Path, float] = {}
+
+    def enqueue(self, path: Path, tries: int = 0) -> None:
+        now = time.time()
+        if tries == 0:
+            if now - self.last_enqueued.get(path, 0.0) < DEDUPE_WINDOW_SEC:
+                return
+            self.last_enqueued[path] = now
+
+        with self.lock:
+            if tries == 0 and path in self.inflight:
+                return
+            self.inflight.add(path)
+
+        self.work_q.put((path, tries))
+
+    def schedule_retry(self, path: Path, tries: int) -> None:
+        if tries >= MAX_RETRIES:
+            log.warning("[GIVE UP] %s", path.name)
+            with self.lock:
+                self.inflight.discard(path)
+            return
+
+        delay = min(RETRY_MAX_SEC, RETRY_BASE_SEC * (2 ** min(tries, 8)))
+        with self.lock:
+            heapq.heappush(self.retry_heap, RetryItem(time.time() + delay, path, tries))
+
+    def retry_loop(self) -> None:
+        while not self.stop.is_set():
+            item: Optional[RetryItem] = None
+            with self.lock:
+                if self.retry_heap and self.retry_heap[0].run_at <= time.time():
+                    item = heapq.heappop(self.retry_heap)
+
+            if item:
+                self.enqueue(item.path, item.tries)
+            else:
+                time.sleep(1)
+
+    def mark_done(self, path: Path) -> None:
+        with self.lock:
+            self.inflight.discard(path)
+
+
+def worker_thread(sched: Scheduler, idx: int) -> None:
+    while not sched.stop.is_set():
         try:
-            Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
-                from_=f"whatsapp:{WHATSAPP_FROM}", to=f"whatsapp:{WHATSAPP_TO}",
-                body=f"🎬 {mtype} Added\n\n{title}\n{details}")
-        except Exception as err: log(f"[WA ERROR] {err}")
+            path, tries = sched.work_q.get(timeout=1)
+        except queue.Empty:
+            continue
 
-# ────────────────────────────────────────────────
-# Main logic
-# ────────────────────────────────────────────────
-def init_database():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS processed_media (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, original_filename TEXT, title TEXT, 
-            media_type TEXT, season INTEGER, episode INTEGER, year INTEGER, 
-            destination_path TEXT, processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        try:
+            res = process_file(path)
+            if res == "retry":
+                sched.schedule_retry(path, tries + 1)
+            else:
+                sched.mark_done(path)
 
-def collect_video_files():
-    files = []
-    if RECURSIVE_SCAN:
-        for r, d, fs in os.walk(WATCH_FOLDER):
-            d[:] = [dn for dn in d if dn.lower() != "sample"]
-            files.extend([Path(r) / f for f in fs if is_video_file(Path(f))])
-    else:
-        files = [p for p in WATCH_FOLDER.iterdir() if p.is_file() and is_video_file(p)]
-    return files
+            if res in {"ignored", "skip", "missing", "done"}:
+                log.info("[%s] %s", res.upper(), path.name)
+        except Exception:
+            log.exception("Worker %s processing crash", idx)
+            sched.schedule_retry(path, tries + 1)
+        finally:
+            sched.work_q.task_done()
 
-def try_process_file(path: Path) -> bool:
-    if looks_like_temporary_file(path.name): return False
-    if SKIP_SAMPLES and "sample" in path.name.lower(): return True
-    if file_is_still_downloading(path, DOWNLOAD_GRACE_SEC): return False
 
-    tv    = parse_tv_show(path.name)
-    movie = parse_movie(path.name)
+class Handler(FileSystemEventHandler):
+    def __init__(self, sched: Scheduler) -> None:
+        self.sched = sched
 
-    if tv:
-        return handle_tv_show(path, *tv)
-    
-    if movie[0]:
-        return handle_movie(path, *movie)
+    def on_created(self, event) -> None:
+        if not event.is_directory:
+            self.sched.enqueue(Path(event.src_path))
 
-    log(f"[UNMATCHED] {path.name}")
-    return True
+    def on_moved(self, event) -> None:
+        if not event.is_directory:
+            self.sched.enqueue(Path(event.dest_path))
 
-def main():
+    def on_modified(self, event) -> None:
+        if not event.is_directory:
+            self.sched.enqueue(Path(event.src_path))
+
+
+def main() -> None:
     init_database()
-    log(f"JellyLink Started | Watch: {WATCH_FOLDER} | Dry-run: {DRY_RUN}")
-    processed = set()
+    log.warning("DRY_RUN is %s", "ON" if DRY_RUN else "OFF")
+
+    if not WATCH_FOLDER.exists():
+        log.error("WATCH_FOLDER missing: %s", WATCH_FOLDER)
+        raise SystemExit(2)
+
+    sched = Scheduler()
+
+    threading.Thread(target=sched.retry_loop, daemon=True).start()
+    for i in range(MAX_WORKERS):
+        threading.Thread(target=worker_thread, args=(sched, i), daemon=True).start()
+
+    obs = Observer()
+    obs.schedule(Handler(sched), str(WATCH_FOLDER), recursive=True)
+    obs.start()
+
+    log.info("Watching: %s", WATCH_FOLDER)
     try:
         while True:
-            for p in collect_video_files():
-                if p not in processed and try_process_file(p):
-                    processed.add(p)
-            time.sleep(SCAN_INTERVAL_SEC)
+            time.sleep(1)
     except KeyboardInterrupt:
-        log("Stopped by user")
+        obs.stop()
+    finally:
+        sched.stop.set()
+        obs.join()
+
 
 if __name__ == "__main__":
     main()
+
